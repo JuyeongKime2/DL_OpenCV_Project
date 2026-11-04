@@ -15,15 +15,50 @@ import mediapipe as mp
 from config import YOLO_POSE_MODEL, EXTRACTORS
 
 
+# =====================================================================
+# [추가된 정규화 로직] 좌표의 중심을 (0,0)으로 맞추고 스케일을 1로 통일
+# =====================================================================
+def normalize_features(feature_array, stride=3):
+    """
+    1차원 배열로 펼쳐진 관절 좌표를 평행이동(Translation) 및 크기(Scale) 정규화합니다.
+    - feature_array: 추출된 1차원 numpy 배열
+    - stride: 관절 1개당 데이터 개수 (x,y,z 의 경우 3)
+    """
+    if len(feature_array) == 0 or np.all(feature_array == 0):
+        return feature_array
+
+    num_keypoints = len(feature_array) // stride
+    try:
+        points = feature_array.reshape(num_keypoints, stride)
+    except ValueError:
+        return feature_array
+
+    xy = points[:, :2]
+
+    # 1. 평행이동 (Translation): 중심점을 (0, 0)으로 이동
+    center = np.mean(xy, axis=0)
+    centered_xy = xy - center
+
+    # 2. 크기 정규화 (Scaling): 가장 먼 관절의 거리를 1로 맞춤
+    max_dist = np.max(np.linalg.norm(centered_xy, axis=1))
+    if max_dist > 0:
+        normalized_xy = centered_xy / max_dist
+    else:
+        normalized_xy = centered_xy
+
+    points[:, :2] = normalized_xy
+    return points.flatten()
+# =====================================================================
+
+
 def _normalize_landmarks(landmarks, image_shape, has_z=True):
-    """랜드마크를 0~1 상대좌표로 정규화. 반환 shape: (N, 3)"""
+    """랜드마크를 0~1 상대좌표로 클리핑. 반환 shape: (N, 3)"""
     h, w = image_shape[:2]
     points = []
     for lm in landmarks:
         x = lm.x
         y = lm.y
         z = getattr(lm, "z", 0.0) if has_z else 0.0
-        # MediaPipe는 이미 0~1 정규화되어 있지만, 안전하게 clamp
         points.append([np.clip(x, 0, 1), np.clip(y, 0, 1), z])
     return np.array(points, dtype=np.float32)
 
@@ -42,7 +77,6 @@ class YoloPoseExtractor:
             return np.zeros(self.num_features, dtype=np.float32), annotated
 
         xy = result.keypoints.xy.cpu().numpy()
-        # 가장 큰 사람 선택
         if result.boxes is not None and len(result.boxes) == len(xy):
             boxes = result.boxes.xyxy.cpu().numpy()
             areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
@@ -57,7 +91,11 @@ class YoloPoseExtractor:
         vec[:, 0] = points[:, 0] / max(w, 1)
         vec[:, 1] = points[:, 1] / max(h, 1)
         vec[:, 2] = conf
-        return vec.reshape(-1), annotated
+        vec = vec.reshape(-1)
+        
+        # [정규화 적용]
+        vec = normalize_features(vec, stride=3)
+        return vec, annotated
 
 
 class MediaPipeHandsExtractor:
@@ -85,6 +123,9 @@ class MediaPipeHandsExtractor:
             annotated, hand_landmarks, self.mp_hands.HAND_CONNECTIONS
         )
         vec = _normalize_landmarks(hand_landmarks.landmark, frame.shape).reshape(-1)
+        
+        # [정규화 적용]
+        vec = normalize_features(vec, stride=3)
         return vec, annotated
 
     def __del__(self):
@@ -139,6 +180,9 @@ class MediaPipeHolisticExtractor:
             features.append(np.zeros((21, 3), dtype=np.float32))
 
         vec = np.concatenate(features, axis=0).reshape(-1)
+        
+        # [정규화 적용]
+        vec = normalize_features(vec, stride=3)
         return vec, annotated
 
     def __del__(self):
