@@ -116,7 +116,7 @@ def train_one(extractor: str, x_train, y_train, x_val, y_val, num_features: int)
             best_f1 = val_f1
             torch.save(model.state_dict(), MODEL_DIR / f"{extractor}_lstm_best.pth")
 
-    # Final evaluation with best weights
+    # Final evaluation with best weights + inference speed
     model.load_state_dict(torch.load(MODEL_DIR / f"{extractor}_lstm_best.pth", map_location=DEVICE))
     model.eval()
     preds, actual = [], []
@@ -124,6 +124,23 @@ def train_one(extractor: str, x_train, y_train, x_val, y_val, num_features: int)
         for xb, yb in val_loader:
             preds.extend(model(xb.to(DEVICE)).argmax(1).cpu().numpy())
             actual.extend(yb.numpy())
+
+    # 추론 속도 측정 (ms / sample)
+    dummy = torch.randn(1, SEQUENCE_LENGTH, num_features).to(DEVICE)
+    # warmup
+    for _ in range(10):
+        _ = model(dummy)
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+    import time
+    t0 = time.perf_counter()
+    N = 100
+    with torch.no_grad():
+        for _ in range(N):
+            _ = model(dummy)
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+    elapsed_ms = (time.perf_counter() - t0) / N * 1000
 
     report = classification_report(
         actual, preds, labels=list(range(NUM_CLASSES)),
@@ -150,6 +167,7 @@ def train_one(extractor: str, x_train, y_train, x_val, y_val, num_features: int)
         "name": EXTRACTORS[extractor]["name"],
         "accuracy": accuracy_score(actual, preds),
         "macro_f1": f1_score(actual, preds, average="macro", zero_division=0),
+        "inference_ms": round(elapsed_ms, 3),
         "num_samples": len(y_train) + len(y_val),
     }
 
@@ -187,13 +205,46 @@ def main():
     df = pd.DataFrame(results).sort_values("macro_f1", ascending=False)
     df.to_csv(OUTPUT_DIR / "model_comparison.csv", index=False, encoding="utf-8-sig")
     print("\n" + "="*60)
-    print("모델 성능 비교 (Macro F1 기준)")
+    print("모델 성능 비교")
     print("="*60)
     print(df.to_string(index=False))
 
+    # 시각화: Accuracy, Macro F1, Inference Time
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+    colors = ["#4C72B0", "#55A868", "#C44E52"]
+
+    axes[0].bar(df["name"], df["accuracy"], color=colors[:len(df)])
+    axes[0].set_title("Accuracy")
+    axes[0].set_ylim(0, 1.05)
+    axes[0].set_ylabel("Score")
+    for i, v in enumerate(df["accuracy"]):
+        axes[0].text(i, v + 0.02, f"{v:.3f}", ha="center")
+
+    axes[1].bar(df["name"], df["macro_f1"], color=colors[:len(df)])
+    axes[1].set_title("Macro F1")
+    axes[1].set_ylim(0, 1.05)
+    for i, v in enumerate(df["macro_f1"]):
+        axes[1].text(i, v + 0.02, f"{v:.3f}", ha="center")
+
+    axes[2].bar(df["name"], df["inference_ms"], color=colors[:len(df)])
+    axes[2].set_title("Inference Time (ms / sample)")
+    axes[2].set_ylabel("ms")
+    for i, v in enumerate(df["inference_ms"]):
+        axes[2].text(i, v + 0.05, f"{v:.2f}", ha="center")
+
+    for ax in axes:
+        ax.tick_params(axis="x", rotation=15)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "model_comparison.png", dpi=150)
+    plt.close()
+    print(f"\n비교 그래프 저장: {OUTPUT_DIR / 'model_comparison.png'}")
+
     best = df.iloc[0]["extractor"]
     (MODEL_DIR / "best_extractor.txt").write_text(best, encoding="utf-8")
-    print(f"\n최종 선택: {EXTRACTORS[best]['name']} + LSTM")
+    print(f"\n최종 선택 모델: {EXTRACTORS[best]['name']} + LSTM")
+    print(f"  - Accuracy: {df.iloc[0]['accuracy']:.4f}")
+    print(f"  - Macro F1: {df.iloc[0]['macro_f1']:.4f}")
+    print(f"  - Inference: {df.iloc[0]['inference_ms']:.2f} ms")
 
 
 if __name__ == "__main__":
