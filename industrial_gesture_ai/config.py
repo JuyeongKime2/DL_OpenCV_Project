@@ -1,3 +1,4 @@
+
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -5,40 +6,56 @@ DATA_DIR = ROOT / "data"
 MODEL_DIR = ROOT / "models"
 OUTPUT_DIR = ROOT / "outputs"
 
-# 세 가지 관절 추출 방식
+# 관절 특징 추출기별 입력 크기
 EXTRACTORS = {
     "yolo": {
         "name": "YOLOv8-Pose",
-        "num_features": 17 * 3,          # COCO 17 keypoints × (x, y, conf)
-        "description": "전신 17개 관절 (어깨·팔꿈치·손목 포함)"
+        "num_features": 17 * 3,
+        "description": "전신 17개 관절 특징",
     },
     "hands": {
         "name": "MediaPipe Hands",
-        "num_features": 21 * 3,          # 21 hand landmarks × (x, y, z)
-        "description": "손 21개 랜드마크 (손가락 모양까지 정밀)"
+        "num_features": 21 * 3,
+        "description": "손 21개 랜드마크 특징",
     },
     "holistic": {
         "name": "MediaPipe Holistic",
-        "num_features": (33 + 21 + 21) * 3,  # pose 33 + left hand 21 + right hand 21 × (x,y,z)
-        "description": "전신 포즈 + 양손 랜드마크"
+        "num_features": (33 + 21 + 21) * 3,
+        "description": "전신 포즈 + 양손 랜드마크 특징",
     },
 }
 
 DEFAULT_EXTRACTOR = "yolo"
 SEQUENCE_LENGTH = 30
-STRIDE = 15
 YOLO_POSE_MODEL = "yolov8n-pose.pt"
 
-# 클래스 정의
+# 제스처 클래스
 CLASS_NAMES = {
     0: "STOP",
     1: "UP",
     2: "DOWN",
+    3: "OTHER",
 }
+
 CLASS_KOREAN = {
     0: "작업 정지",
     1: "장비 상승",
     2: "장비 하강",
+    3: "수신호 아님 / 기타",
 }
 
-NUM_CLASSES = 3
+NUM_CLASSES = len(CLASS_NAMES)
+
+# 수집 단계의 최소 관절 검출 비율
+MIN_VALID_FRAME_RATIO = 0.80
+
+# 실시간 인식 안정화
+MIN_MODEL_SCORE = 0.60
+SMOOTHING_WINDOW = 5
+MIN_CONSISTENT_VOTES = 3
+PREDICTION_INTERVAL = 5
+
+# 세션 독립 평가 설정
+MIN_SESSION_COUNT = 5
+MIN_TRAIN_SAMPLES_PER_CLASS = 10
+MIN_EVAL_SAMPLES_PER_CLASS = 5
