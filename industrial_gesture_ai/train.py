@@ -28,16 +28,22 @@ HIDDEN = 96
 
 
 class GestureDataset(Dataset):
-    def __init__(self, x, y):
+    def __init__(self, x, y, is_train=False):
         self.x = torch.tensor(x, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.long)
+        self.is_train = is_train
 
     def __len__(self):
         return len(self.y)
 
     def __getitem__(self, idx):
-        return self.x[idx], self.y[idx]
-
+        features = self.x[idx]
+        # Train 단계에서만 가우시안 노이즈(표준편차 0.02)를 주입하여 데이터 암기 방지
+        if self.is_train:
+            noise = torch.randn_like(features) * 0.02
+            features = features + noise
+            
+        return features, self.y[idx]
 
 class GestureNet(nn.Module):
     def __init__(self, input_size, hidden=HIDDEN, classes=NUM_CLASSES):
@@ -80,10 +86,13 @@ def load_data(extractor: str):
 
 def train_one(extractor: str, x_train, y_train, x_val, y_val, num_features: int):
     model = GestureNet(num_features).to(DEVICE)
-    train_loader = DataLoader(GestureDataset(x_train, y_train), batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(GestureDataset(x_val, y_val), batch_size=BATCH_SIZE)
+    
+    # Train 셋에만 is_train=True를 부여하여 Data Augmentation(노이즈) 활성화
+    train_loader = DataLoader(GestureDataset(x_train, y_train, is_train=True), batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(GestureDataset(x_val, y_val, is_train=False), batch_size=BATCH_SIZE)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    # weight_decay(L2 Regularization)를 추가하여 모델의 가중치 과적합 억제
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
     best_f1 = -1.0
 
@@ -125,23 +134,33 @@ def train_one(extractor: str, x_train, y_train, x_val, y_val, num_features: int)
             preds.extend(model(xb.to(DEVICE)).argmax(1).cpu().numpy())
             actual.extend(yb.numpy())
 
-    # 추론 속도 측정 (ms / sample)
+    # ==========================================
+    # 추론 속도 측정 (ms / sample) - 측정 오류 교정본
+    # ==========================================
     dummy = torch.randn(1, SEQUENCE_LENGTH, num_features).to(DEVICE)
-    # warmup
-    for _ in range(10):
+    
+    # 1. 충분한 Warm-up (초기 로딩 지연 제거)
+    for _ in range(100):
         _ = model(dummy)
     if DEVICE == "cuda":
         torch.cuda.synchronize()
+        
     import time
-    t0 = time.perf_counter()
-    N = 100
+    
+    times = []
+    N = 300  # 측정 횟수 증가
+    
     with torch.no_grad():
         for _ in range(N):
+            t0 = time.perf_counter()
             _ = model(dummy)
-    if DEVICE == "cuda":
-        torch.cuda.synchronize()
-    elapsed_ms = (time.perf_counter() - t0) / N * 1000
-
+            if DEVICE == "cuda":
+                torch.cuda.synchronize()
+            times.append((time.perf_counter() - t0) * 1000)
+            
+    # 2. 튀는 값(OS Noise)을 완벽히 배제하기 위해 '중간값(Median)' 채택
+    elapsed_ms = np.median(times)
+    # ==========================================
     report = classification_report(
         actual, preds, labels=list(range(NUM_CLASSES)),
         target_names=[CLASS_NAMES[i] for i in range(NUM_CLASSES)],
@@ -202,7 +221,10 @@ def main():
         print("\n학습된 모델이 없습니다. 데이터를 먼저 수집하세요.")
         return
 
-    df = pd.DataFrame(results).sort_values("macro_f1", ascending=False)
+    # [수정된 부분] 성능(macro_f1)은 내림차순(False: 높은 순), 속도(inference_ms)는 오름차순(True: 빠른 순)으로 정렬
+    df = pd.DataFrame(results)
+    df = df.sort_values(by=['macro_f1', 'inference_ms'], ascending=[False, True])
+    
     df.to_csv(OUTPUT_DIR / "model_comparison.csv", index=False, encoding="utf-8-sig")
     print("\n" + "="*60)
     print("모델 성능 비교")
