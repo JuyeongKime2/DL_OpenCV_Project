@@ -1,4 +1,6 @@
-"""세션 독립 분할 기반 LSTM 학습 및 최종 테스트 평가 (데이터 증강 및 규제 추가)."""
+"""세션 독립 분할 기반 LSTM 학습 및 최종 테스트 평가
+(강화된 데이터 증강 + Attention Pooling + Label Smoothing + LR Scheduler + 추출기별 HP)
+"""
 
 import argparse
 import json
@@ -13,6 +15,7 @@ import platform
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from sklearn.metrics import (
     accuracy_score,
@@ -43,14 +46,40 @@ from config import (
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ============================================================
-# [튜닝 포인트 1] 하이퍼파라미터 조정 (과적합 방지)
+# 하이퍼파라미터 (기본값, 추출기별로 override)
 # ============================================================
 EPOCHS = 60
 BATCH_SIZE = 32
-LEARNING_RATE = 5e-4  # 학습률 하향 조정 (기존 1e-3 -> 5e-4)
-HIDDEN_SIZE = 64      # 은닉층 크기 축소 (기존 96 -> 64)
-PATIENCE = 10
+PATIENCE = 12
 RANDOM_SEED = 42
+
+# 추출기별 권장 하이퍼파라미터
+EXTRACTOR_HYPERPARAMS = {
+    "pose": {
+        "hidden": 48,
+        "dropout": 0.40,
+        "lr": 3e-4,
+        "weight_decay": 2e-3,
+        "bidirectional": True,
+        "use_attention": True,
+    },
+    "dual_hands": {
+        "hidden": 64,
+        "dropout": 0.45,
+        "lr": 4e-4,
+        "weight_decay": 1.5e-3,
+        "bidirectional": True,
+        "use_attention": True,
+    },
+    "holistic": {
+        "hidden": 80,
+        "dropout": 0.35,
+        "lr": 5e-4,
+        "weight_decay": 1e-3,
+        "bidirectional": False,
+        "use_attention": True,
+    },
+}
 
 
 def set_seed(seed=RANDOM_SEED):
@@ -62,60 +91,142 @@ def set_seed(seed=RANDOM_SEED):
 
 
 # ============================================================
-# [튜닝 포인트 2] 데이터셋 및 실시간 데이터 증강(Augmentation)
+# 강화된 데이터 증강 (Time Warp / Magnitude Warp / Shift 포함)
 # ============================================================
 class GestureDataset(Dataset):
-    def __init__(self, x, y, augment=False):
+    def __init__(self, x, y, augment=False, strong_aug=True):
         self.x = torch.tensor(x, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.long)
         self.augment = augment
+        self.strong_aug = strong_aug
 
     def __len__(self):
         return len(self.y)
 
+    def _time_warp(self, seq, sigma=0.15):
+        T = seq.shape[0]
+        warp = np.linspace(0, T - 1, T) + np.random.normal(0, sigma, T)
+        warp = np.clip(warp, 0, T - 1)
+        idx = np.arange(T)
+        
+        seq_np = seq.numpy()
+        warped = np.zeros_like(seq_np)
+        
+        # np.interp는 1D 배열만 지원하므로 특징(열)별로 개별 보간 적용
+        for i in range(seq_np.shape[1]):
+            warped[:, i] = np.interp(idx, warp, seq_np[:, i])
+            
+        return torch.tensor(warped, dtype=seq.dtype)
+
+    def _magnitude_warp(self, seq, sigma=0.08):
+        T = seq.shape[0]
+        curve = np.random.normal(1.0, sigma, T)
+        return seq * torch.tensor(curve, dtype=seq.dtype).unsqueeze(-1)
+
     def __getitem__(self, index):
         sequence = self.x[index].clone()
-        
-        # 학습 시에만 노이즈 및 크기 변환 적용
+
         if self.augment:
-            # Jittering (가우시안 노이즈 추가)
-            noise = torch.randn_like(sequence) * 0.015
-            sequence = sequence + noise
-            
-            # Scaling (크기 조절 0.9 ~ 1.1배)
-            scale_factor = torch.empty(1).uniform_(0.9, 1.1).item()
-            sequence = sequence * scale_factor
+            noise_std = 0.02 if self.strong_aug else 0.015
+            sequence = sequence + torch.randn_like(sequence) * noise_std
+
+            scale = torch.empty(1).uniform_(0.85, 1.15).item()
+            sequence = sequence * scale
+
+            if self.strong_aug and torch.rand(1) < 0.5:
+                sequence = self._time_warp(sequence, sigma=0.15)
+
+            if self.strong_aug and torch.rand(1) < 0.4:
+                sequence = self._magnitude_warp(sequence, sigma=0.08)
+
+            if torch.rand(1) < 0.3:
+                shift = torch.randint(-2, 3, (1,)).item()
+                if shift != 0:
+                    sequence = torch.roll(sequence, shifts=shift, dims=0)
 
         return sequence, self.y[index]
 
 
 # ============================================================
-# [튜닝 포인트 3] LSTM 모델 규제 강화 (Dropout & 단순화)
+# Attention Pooling
+# ============================================================
+class AttentionPooling(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.attn = nn.Linear(hidden_size, 1)
+
+    def forward(self, lstm_out):
+        scores = self.attn(lstm_out)
+        weights = torch.softmax(scores, dim=1)
+        context = torch.sum(weights * lstm_out, dim=1)
+        return context
+
+
+# ============================================================
+# 개선된 LSTM 모델 (Attention + BiLSTM 옵션 + LayerNorm)
 # ============================================================
 class GestureNet(nn.Module):
-    def __init__(self, input_size, hidden=HIDDEN_SIZE, classes=NUM_CLASSES):
+    def __init__(self, input_size, hidden=64, classes=NUM_CLASSES,
+                 dropout=0.4, bidirectional=False, use_attention=True):
         super().__init__()
-        
+        self.use_attention = use_attention
+        num_directions = 2 if bidirectional else 1
+
         self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden,
-            num_layers=1,         # 레이어 수 축소 (기존 2 -> 1)
+            num_layers=1,
             batch_first=True,
-            # num_layers=1일 경우 lstm 내부 dropout은 무시되므로 제거
+            bidirectional=bidirectional,
+            dropout=0.0,
         )
 
+        out_size = hidden * num_directions
+
+        if use_attention:
+            self.pool = AttentionPooling(out_size)
+        else:
+            self.pool = None
+
         self.classifier = nn.Sequential(
-            nn.Dropout(0.4),      # Dropout 비율 강화 (기존 0.25 -> 0.4)
-            nn.Linear(hidden, classes),
+            nn.LayerNorm(out_size),
+            nn.Dropout(dropout),
+            nn.Linear(out_size, classes),
         )
 
     def forward(self, x):
         output, _ = self.lstm(x)
-        return self.classifier(output[:, -1, :])
+        if self.use_attention:
+            pooled = self.pool(output)
+        else:
+            pooled = output[:, -1, :]
+        return self.classifier(pooled)
 
 
 # ============================================================
-# 4. 세션 단위 데이터 로드
+# Label Smoothing Cross Entropy
+# ============================================================
+class LabelSmoothingCrossEntropy(nn.Module):
+    def __init__(self, smoothing=0.1, weight=None):
+        super().__init__()
+        self.smoothing = smoothing
+        self.weight = weight
+
+    def forward(self, pred, target):
+        n_class = pred.size(1)
+        log_preds = F.log_softmax(pred, dim=-1)
+        with torch.no_grad():
+            true_dist = torch.zeros_like(log_preds)
+            true_dist.fill_(self.smoothing / (n_class - 1))
+            true_dist.scatter_(1, target.data.unsqueeze(1), 1.0 - self.smoothing)
+        loss = torch.sum(-true_dist * log_preds, dim=-1)
+        if self.weight is not None:
+            loss = loss * self.weight[target]
+        return loss.mean()
+
+
+# ============================================================
+# 데이터 로드 (기존과 동일)
 # ============================================================
 def load_data(extractor_name):
     num_features = EXTRACTORS[extractor_name]["num_features"]
@@ -133,10 +244,7 @@ def load_data(extractor_name):
     if not sessions_root.exists():
         raise RuntimeError(f"세션 데이터 폴더가 없습니다: {sessions_root}\n먼저 python collect_data.py --extractor {extractor_name} 를 실행하세요.")
 
-    x_list = []
-    y_list = []
-    group_list = []
-    path_list = []
+    x_list, y_list, group_list, path_list = [], [], [], []
     session_dirs = sorted(path for path in sessions_root.iterdir() if path.is_dir())
 
     for session_dir in session_dirs:
@@ -157,7 +265,7 @@ def load_data(extractor_name):
                 if not np.isfinite(sample).all():
                     print(f"[제외] NaN/Inf 포함: {file_path}")
                     continue
-                
+
                 x_list.append(sample.astype(np.float32))
                 y_list.append(label_id)
                 group_list.append(session_id)
@@ -172,19 +280,14 @@ def load_data(extractor_name):
     return x, y, groups, num_features, path_list
 
 
-# ============================================================
-# 5. 세션 분할 보조 함수
-# ============================================================
 def _class_counts(y, indices):
     return np.bincount(y[indices], minlength=NUM_CLASSES)
+
 
 def _has_minimum_samples(y, indices, minimum):
     return bool(np.all(_class_counts(y, indices) >= minimum))
 
 
-# ============================================================
-# 6. 세션 단위 Train / Validation / Test 분할
-# ============================================================
 def split_by_session(x, y, groups, seed=RANDOM_SEED):
     unique_sessions = np.unique(groups)
     session_count = len(unique_sessions)
@@ -208,19 +311,23 @@ def split_by_session(x, y, groups, seed=RANDOM_SEED):
     for attempt in range(2000):
         rng = np.random.default_rng(seed + attempt)
         shuffled = rng.permutation(unique_sessions)
-        
+
         test_sessions = shuffled[:test_session_count]
         val_sessions = shuffled[test_session_count:test_session_count + val_session_count]
         train_sessions = shuffled[test_session_count + val_session_count:]
-        
+
         train_idx = np.where(np.isin(groups, train_sessions))[0]
         val_idx = np.where(np.isin(groups, val_sessions))[0]
         test_idx = np.where(np.isin(groups, test_sessions))[0]
 
-        if len(train_idx) == 0 or len(val_idx) == 0 or len(test_idx) == 0: continue
-        if not _has_minimum_samples(y, train_idx, MIN_TRAIN_SAMPLES_PER_CLASS): continue
-        if not _has_minimum_samples(y, val_idx, MIN_EVAL_SAMPLES_PER_CLASS): continue
-        if not _has_minimum_samples(y, test_idx, MIN_EVAL_SAMPLES_PER_CLASS): continue
+        if len(train_idx) == 0 or len(val_idx) == 0 or len(test_idx) == 0:
+            continue
+        if not _has_minimum_samples(y, train_idx, MIN_TRAIN_SAMPLES_PER_CLASS):
+            continue
+        if not _has_minimum_samples(y, val_idx, MIN_EVAL_SAMPLES_PER_CLASS):
+            continue
+        if not _has_minimum_samples(y, test_idx, MIN_EVAL_SAMPLES_PER_CLASS):
+            continue
 
         train_set = set(groups[train_idx])
         val_set = set(groups[val_idx])
@@ -228,7 +335,7 @@ def split_by_session(x, y, groups, seed=RANDOM_SEED):
 
         if train_set & val_set or train_set & test_set or val_set & test_set:
             raise RuntimeError("데이터 분할 중 세션 중복이 발견되었습니다.")
-        
+
         return train_idx, val_idx, test_idx
 
     raise RuntimeError(
@@ -237,12 +344,8 @@ def split_by_session(x, y, groups, seed=RANDOM_SEED):
     )
 
 
-# ============================================================
-# 7. 예측 함수
-# ============================================================
 def predict(model, loader):
-    actual = []
-    predictions = []
+    actual, predictions = [], []
     model.eval()
     with torch.no_grad():
         for batch_x, batch_y in loader:
@@ -252,75 +355,74 @@ def predict(model, loader):
     return np.asarray(actual), np.asarray(predictions)
 
 
-# ============================================================
-# 8. 추론 속도 측정
-# ============================================================
-def measure_inference_ms(model, num_features):
-    dummy = torch.randn(1, SEQUENCE_LENGTH, num_features, device=DEVICE)
+def measure_inference_ms(model, num_features, n=50):
     model.eval()
+    dummy = torch.randn(1, SEQUENCE_LENGTH, num_features, device=DEVICE)
+    times = []
     with torch.no_grad():
-        for _ in range(15): model(dummy)
-        if DEVICE == "cuda": torch.cuda.synchronize()
-        elapsed_times = []
-        for _ in range(100):
+        for _ in range(n):
             start = time.perf_counter()
-            model(dummy)
-            if DEVICE == "cuda": torch.cuda.synchronize()
-            elapsed_times.append((time.perf_counter() - start) * 1000)
-    return float(np.median(elapsed_times))
+            _ = model(dummy)
+            if DEVICE == "cuda":
+                torch.cuda.synchronize()
+            times.append((time.perf_counter() - start) * 1000)
+    return float(np.median(times))
 
 
 # ============================================================
-# 9. 단일 모델 학습 및 평가
+# 단일 모델 학습 및 평가 (개선 버전)
 # ============================================================
 def train_one(extractor_name, x, y, groups, split, num_features):
     train_idx, val_idx, test_idx = split
-    
+
     x_train, y_train = x[train_idx], y[train_idx]
     x_val, y_val = x[val_idx], y[val_idx]
     x_test, y_test = x[test_idx], y[test_idx]
 
-    train_loader = DataLoader(
-        GestureDataset(x_train, y_train, augment=True), # 학습 시에만 Augment 활성화
-        batch_size=BATCH_SIZE, shuffle=True, pin_memory=(DEVICE == "cuda")
-    )
+    hp = EXTRACTOR_HYPERPARAMS.get(extractor_name, EXTRACTOR_HYPERPARAMS["dual_hands"])
 
+    train_loader = DataLoader(
+        GestureDataset(x_train, y_train, augment=True, strong_aug=True),
+        batch_size=BATCH_SIZE, shuffle=True, pin_memory=(DEVICE == "cuda"),
+    )
     val_loader = DataLoader(
         GestureDataset(x_val, y_val, augment=False),
-        batch_size=BATCH_SIZE, shuffle=False, pin_memory=(DEVICE == "cuda")
+        batch_size=BATCH_SIZE, shuffle=False, pin_memory=(DEVICE == "cuda"),
     )
-
     test_loader = DataLoader(
         GestureDataset(x_test, y_test, augment=False),
-        batch_size=BATCH_SIZE, shuffle=False, pin_memory=(DEVICE == "cuda")
+        batch_size=BATCH_SIZE, shuffle=False, pin_memory=(DEVICE == "cuda"),
     )
 
-    model = GestureNet(num_features).to(DEVICE)
-    
-    # [튜닝 포인트 4] L2 Regularization(가중치 감쇠) 강화
-    optimizer = torch.optim.Adam(
+    model = GestureNet(
+        input_size=num_features,
+        hidden=hp["hidden"],
+        classes=NUM_CLASSES,
+        dropout=hp["dropout"],
+        bidirectional=hp["bidirectional"],
+        use_attention=hp["use_attention"],
+    ).to(DEVICE)
+
+    optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=1e-3 # 기존 1e-4 -> 1e-3 변경
+        lr=hp["lr"],
+        weight_decay=hp["weight_decay"],
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPOCHS, eta_min=hp["lr"] * 0.1
     )
 
     train_counts = np.bincount(y_train, minlength=NUM_CLASSES).astype(np.float32)
     class_weights = len(y_train) / (NUM_CLASSES * np.maximum(train_counts, 1.0))
-    criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=DEVICE))
+    criterion = LabelSmoothingCrossEntropy(
+        smoothing=0.1,
+        weight=torch.tensor(class_weights, dtype=torch.float32, device=DEVICE),
+    )
 
     best_val_macro_f1 = -1.0
-    best_epoch = 0
     best_state = None
     patience_left = PATIENCE
-
-    train_sessions = sorted(np.unique(groups[train_idx]).tolist())
-    val_sessions = sorted(np.unique(groups[val_idx]).tolist())
-    test_sessions = sorted(np.unique(groups[test_idx]).tolist())
-
-    print("데이터 분할 결과")
-    print(f"Train 세션: {train_sessions} / 샘플 {len(train_idx)}")
-    print(f"Validation 세션: {val_sessions} / 샘플 {len(val_idx)}")
-    print(f"Test 세션: {test_sessions} / 샘플 {len(test_idx)}")
+    best_epoch = 0
 
     for epoch in range(EPOCHS):
         model.train()
@@ -328,30 +430,34 @@ def train_one(extractor_name, x, y, groups, split, num_features):
         for batch_x, batch_y in train_loader:
             batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
             optimizer.zero_grad(set_to_none=True)
-            
             logits = model(batch_x)
             loss = criterion(logits, batch_y)
             loss.backward()
-            
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             losses.append(float(loss.item()))
+
+        scheduler.step()
 
         val_actual, val_predictions = predict(model, val_loader)
         val_macro_f1 = f1_score(val_actual, val_predictions, average="macro", zero_division=0)
 
         if epoch == 0 or (epoch + 1) % 5 == 0:
-            print(f"[{extractor_name}] Epoch {epoch + 1:02d}/{EPOCHS} | loss={np.mean(losses):.4f} | Validation Macro F1={val_macro_f1:.4f}")
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(
+                f"[{extractor_name}] Epoch {epoch + 1:02d}/{EPOCHS} | "
+                f"loss={np.mean(losses):.4f} | Val Macro F1={val_macro_f1:.4f} | LR={current_lr:.2e}"
+            )
 
         if val_macro_f1 > best_val_macro_f1 + 1e-5:
             best_val_macro_f1 = float(val_macro_f1)
             best_epoch = epoch + 1
-            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             patience_left = PATIENCE
         else:
             patience_left -= 1
             if patience_left <= 0:
-                print(f"조기 종료: Validation Macro F1이 {PATIENCE} epoch 동안 개선되지 않았습니다.")
+                print(f"조기 종료: Validation Macro F1이 {PATIENCE} epoch 동안 개선되지 않았습니다. (best epoch={best_epoch})")
                 break
 
     if best_state is None:
@@ -375,7 +481,9 @@ def train_one(extractor_name, x, y, groups, split, num_features):
     test_weighted_f1 = float(f1_score(actual, predictions, average="weighted", zero_division=0))
     test_balanced_accuracy = float(balanced_accuracy_score(actual, predictions))
 
-    report = classification_report(actual, predictions, labels=labels, target_names=target_names, output_dict=True, zero_division=0)
+    report = classification_report(
+        actual, predictions, labels=labels, target_names=target_names, output_dict=True, zero_division=0
+    )
     matrix = confusion_matrix(actual, predictions, labels=labels)
     inference_ms = measure_inference_ms(model, num_features)
 
@@ -398,7 +506,7 @@ def train_one(extractor_name, x, y, groups, split, num_features):
     detail = {
         "extractor": extractor_name,
         "extractor_name": EXTRACTORS[extractor_name]["name"],
-        "evaluation_protocol": "single_session_stratified_random_split" if len(np.unique(groups)) < 2 else "session_independent_holdout",
+        "evaluation_protocol": "single_session_stratified_random_split" if len(np.unique(groups)) < 2 else "session_independent",
         "best_epoch_selected_by_validation_macro_f1": best_epoch,
         "best_validation_macro_f1": best_val_macro_f1,
         "test_accuracy": test_accuracy,
@@ -409,22 +517,24 @@ def train_one(extractor_name, x, y, groups, split, num_features):
         "test_balanced_accuracy": test_balanced_accuracy,
         "majority_class_baseline_accuracy": majority_baseline,
         "model_only_inference_ms_per_sequence": inference_ms,
-        "train_sample_count": int(len(train_idx)),
-        "validation_sample_count": int(len(val_idx)),
-        "test_sample_count": int(len(test_idx)),
-        "train_sessions": train_sessions,
-        "validation_sessions": val_sessions,
-        "test_sessions": test_sessions,
+        "train_sample_count": int(len(y_train)),
+        "validation_sample_count": int(len(y_val)),
+        "test_sample_count": int(len(y_test)),
+        "train_sessions": sorted(set(groups[train_idx].tolist())),
+        "validation_sessions": sorted(set(groups[val_idx].tolist())),
+        "test_sessions": sorted(set(groups[test_idx].tolist())),
         "test_true_class_counts": true_counts,
         "test_predicted_class_counts": predicted_counts,
         "classification_report": report,
         "confusion_matrix": matrix.tolist(),
+        "hyperparams": hp,
     }
 
     report_path = OUTPUT_DIR / f"{extractor_name}_report.json"
-    report_path.write_text(json.dumps(detail, ensure_ascii=False, indent=2), encoding="utf-8")
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(detail, f, ensure_ascii=False, indent=2)
 
-    return {
+    result = {
         "extractor": extractor_name,
         "name": EXTRACTORS[extractor_name]["name"],
         "validation_macro_f1": best_val_macro_f1,
@@ -435,164 +545,98 @@ def train_one(extractor_name, x, y, groups, split, num_features):
         "test_weighted_f1": test_weighted_f1,
         "test_balanced_accuracy": test_balanced_accuracy,
         "majority_baseline_accuracy": majority_baseline,
-        "model_inference_ms": round(inference_ms, 3),
-        "train_samples": len(train_idx),
-        "validation_samples": len(val_idx),
-        "test_samples": len(test_idx),
-        "session_count": len(np.unique(groups)),
+        "model_inference_ms": inference_ms,
+        "train_samples": int(len(y_train)),
+        "validation_samples": int(len(y_val)),
+        "test_samples": int(len(y_test)),
+        "session_count": int(len(np.unique(groups))),
         "best_epoch": best_epoch,
     }
-
-
-# ============================================================
-# 10. 전체 모델 학습 및 비교
-# ============================================================
-
-# ============================================================
-# 11. 화려한 시각화 (레이더, 속도-정확도, 히트맵, 대시보드)
-# ============================================================
-COLORS = {"yolo": "#4169A1", "hands": "#4F9D75", "holistic": "#C66B5D"}
+    return result
 
 
 def _load_reports():
     reports = {}
-    for name in EXTRACTORS.keys():
-        path = OUTPUT_DIR / f"{name}_report.json"
+    for extractor in EXTRACTORS:
+        path = OUTPUT_DIR / f"{extractor}_report.json"
         if path.exists():
             with open(path, encoding="utf-8") as f:
-                reports[name] = json.load(f)
+                reports[extractor] = json.load(f)
     return reports
 
 
 def plot_radar(reports, save_path):
-    metrics = ["test_accuracy", "test_macro_f1", "test_balanced_accuracy",
-               "test_macro_precision", "test_macro_recall"]
-    labels = ["Accuracy", "Macro F1", "Balanced Acc", "Precision", "Recall"]
-    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
-    angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
-    angles += angles[:1]
-    for name, report in reports.items():
-        values = [report.get(m, 0) for m in metrics]
-        values += values[:1]
-        color = COLORS.get(name, "#888")
-        ax.plot(angles, values, "o-", linewidth=2, label=EXTRACTORS[name]["name"], color=color)
-        ax.fill(angles, values, alpha=0.15, color=color)
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(labels, size=11)
-    ax.set_ylim(0, 1.05)
-    ax.set_title("모델 성능 레이더 차트", size=16, pad=20, weight="bold")
-    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1))
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=180, bbox_inches="tight")
-    plt.close()
-
-
-def plot_speed_accuracy(df, save_path):
-    if df is None or "model_inference_ms" not in df.columns:
-        return
-    fig, ax = plt.subplots(figsize=(8, 6))
-    for _, row in df.iterrows():
-        color = COLORS.get(row["extractor"], "#888")
-        ax.scatter(row["model_inference_ms"], row["test_accuracy"], s=300,
-                   color=color, edgecolors="black", linewidth=1.5, zorder=3)
-        ax.annotate(row["name"], (row["model_inference_ms"], row["test_accuracy"]),
-                    textcoords="offset points", xytext=(8, 8), fontsize=10, fontweight="bold")
-    ax.set_xlabel("Inference Time (ms / sequence)", fontsize=12)
-    ax.set_ylabel("Test Accuracy", fontsize=12)
-    ax.set_title("속도 vs 정확도 트레이드오프", fontsize=16, weight="bold")
-    ax.set_ylim(0, 1.05)
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=180)
-    plt.close()
-
-
-def plot_class_heatmap(reports, save_path):
-    class_names = list(CLASS_NAMES.values())
-    data = []
-    for name, report in reports.items():
-        cr = report.get("classification_report", {})
-        row = [cr.get(cname, {}).get("f1-score", 0) for cname in class_names]
-        data.append(row)
-    df = pd.DataFrame(data, index=[EXTRACTORS[n]["name"] for n in reports.keys()], columns=class_names)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    sns.heatmap(df, annot=True, fmt=".3f", cmap="YlGnBu", vmin=0, vmax=1, ax=ax, linewidths=0.5)
-    ax.set_title("클래스별 F1-Score 히트맵", fontsize=16, weight="bold", pad=12)
-    ax.set_ylabel("")
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=180)
-    plt.close()
-
-
-def plot_dashboard(reports, df, save_path):
-    from matplotlib.gridspec import GridSpec
-    fig = plt.figure(figsize=(16, 12))
-    gs = GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.3)
-
-    ax1 = fig.add_subplot(gs[0, 0], polar=True)
     metrics = ["test_accuracy", "test_macro_f1", "test_balanced_accuracy"]
     labels = ["Accuracy", "Macro F1", "Balanced Acc"]
     angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
     angles += angles[:1]
+
+    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
     for name, report in reports.items():
         values = [report.get(m, 0) for m in metrics]
         values += values[:1]
-        color = COLORS.get(name, "#888")
-        ax1.plot(angles, values, "o-", linewidth=2, color=color, label=EXTRACTORS[name]["name"])
-        ax1.fill(angles, values, alpha=0.12, color=color)
-    ax1.set_xticks(angles[:-1])
-    ax1.set_xticklabels(labels, size=10)
-    ax1.set_ylim(0, 1.05)
-    ax1.set_title("핵심 지표 레이더", size=13, weight="bold", pad=15)
-    ax1.legend(loc="upper right", bbox_to_anchor=(1.35, 1.15), fontsize=9)
+        ax.plot(angles, values, label=EXTRACTORS[name]["name"])
+        ax.fill(angles, values, alpha=0.15)
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(labels)
+    ax.set_ylim(0, 1)
+    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1))
+    plt.title("Model Comparison (Radar)")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=160)
+    plt.close()
 
-    ax2 = fig.add_subplot(gs[0, 1])
-    if df is not None:
-        names = df["name"].tolist()
-        f1s = df["test_macro_f1"].tolist()
-        colors = [COLORS.get(e, "#888") for e in df["extractor"]]
-        bars = ax2.barh(names, f1s, color=colors, edgecolor="black")
-        ax2.set_xlim(0, 1.05)
-        ax2.set_xlabel("Test Macro F1")
-        ax2.set_title("Macro F1 비교", size=13, weight="bold")
-        for bar, v in zip(bars, f1s):
-            ax2.text(v + 0.01, bar.get_y() + bar.get_height() / 2, f"{v:.3f}", va="center", fontsize=10)
 
-    ax3 = fig.add_subplot(gs[1, 0])
-    if df is not None and "model_inference_ms" in df.columns:
-        names = df["name"].tolist()
-        speeds = df["model_inference_ms"].tolist()
-        colors = [COLORS.get(e, "#888") for e in df["extractor"]]
-        bars = ax3.bar(names, speeds, color=colors, edgecolor="black")
-        ax3.set_ylabel("Inference Time (ms)")
-        ax3.set_title("추론 속도 비교", size=13, weight="bold")
-        ax3.tick_params(axis="x", rotation=15)
-        for bar, v in zip(bars, speeds):
-            ax3.text(bar.get_x() + bar.get_width() / 2, v + 0.05, f"{v:.2f}", ha="center", fontsize=9)
+def plot_speed_accuracy(df, save_path):
+    plt.figure(figsize=(8, 5))
+    for _, row in df.iterrows():
+        plt.scatter(row["model_inference_ms"], row["test_accuracy"], s=120, label=row["name"])
+        plt.annotate(row["name"], (row["model_inference_ms"], row["test_accuracy"]),
+                     textcoords="offset points", xytext=(5, 5))
+    plt.xlabel("Inference Time (ms / sequence)")
+    plt.ylabel("Test Accuracy")
+    plt.title("Speed vs Accuracy")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=160)
+    plt.close()
 
-    ax4 = fig.add_subplot(gs[1, 1])
-    ax4.axis("off")
-    summary = ["모델 성능 요약\n"]
-    if df is not None:
-        best = df.sort_values("test_macro_f1", ascending=False).iloc[0]
-        summary.append(f"최고 Macro F1: {best['name']}")
-        summary.append(f"  → {best['test_macro_f1']:.4f}")
-        if "model_inference_ms" in df.columns:
-            fastest = df.sort_values("model_inference_ms").iloc[0]
-            summary.append(f"\n최고 속도: {fastest['name']}")
-            summary.append(f"  → {fastest['model_inference_ms']:.2f} ms")
-    protocols = {r.get("evaluation_protocol", "") for r in reports.values()}
-    if "single_session_stratified_random_split" in protocols:
-        summary.append("\n⚠ 평가 프로토콜:")
-        summary.append("단일 세션 랜덤 분할")
-        summary.append("(과대평가 가능성 있음)")
-    ax4.text(0.05, 0.95, "\n".join(summary), transform=ax4.transAxes, fontsize=12,
-             verticalalignment="top", fontfamily="monospace",
-             bbox=dict(boxstyle="round", facecolor="#f8f9fa", edgecolor="#dee2e6", pad=0.8))
-    ax4.set_title("요약", size=13, weight="bold")
 
-    fig.suptitle("산업현장 수신호 인식 모델 비교 대시보드", fontsize=18, weight="bold", y=0.98)
-    plt.savefig(save_path, dpi=180, bbox_inches="tight")
+def plot_class_heatmap(reports, save_path):
+    classes = list(CLASS_NAMES.values())
+    data = []
+    names = []
+    for name, report in reports.items():
+        f1s = []
+        for cls in classes:
+            f1s.append(report["classification_report"].get(cls, {}).get("f1-score", 0))
+        data.append(f1s)
+        names.append(EXTRACTORS[name]["name"])
+    data = np.array(data)
+    plt.figure(figsize=(8, 4))
+    sns.heatmap(data, annot=True, fmt=".2f", cmap="YlGnBu",
+                xticklabels=classes, yticklabels=names)
+    plt.title("Per-Class F1 Score")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=160)
+    plt.close()
+
+
+def plot_dashboard(reports, df, save_path):
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    # 간단한 대시보드 (필요시 확장)
+    axes[0, 0].bar(df["name"], df["test_macro_f1"])
+    axes[0, 0].set_title("Test Macro F1")
+    axes[0, 0].set_ylim(0, 1)
+    axes[0, 1].bar(df["name"], df["test_accuracy"])
+    axes[0, 1].set_title("Test Accuracy")
+    axes[0, 1].set_ylim(0, 1)
+    axes[1, 0].bar(df["name"], df["model_inference_ms"])
+    axes[1, 0].set_title("Inference Time (ms)")
+    axes[1, 1].axis("off")
+    plt.suptitle("Model Comparison Dashboard")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=160)
     plt.close()
 
 
@@ -615,7 +659,7 @@ def generate_fancy_visualizations(comparison_df):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="산업현장 수신호 LSTM 학습 및 독립 테스트 평가")
+    parser = argparse.ArgumentParser(description="산업현장 수신호 LSTM 학습 및 독립 테스트 평가 (개선 버전)")
     parser.add_argument("--extractor", choices=list(EXTRACTORS.keys()), default=None, help="특정 추출기만 학습")
     parser.add_argument("--seed", type=int, default=RANDOM_SEED)
     args = parser.parse_args()
@@ -711,10 +755,8 @@ def main():
     print(f"- {OUTPUT_DIR / '*_confusion_matrix.png'}")
     print(f"- {OUTPUT_DIR / 'model_comparison.png'}")
 
-
-
-    # 화려한 시각화 생성
     generate_fancy_visualizations(comparison)
+
 
 if __name__ == "__main__":
     main()

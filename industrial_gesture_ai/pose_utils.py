@@ -74,156 +74,77 @@ def _normalize_landmarks(landmarks):
 
 
 # ============================================================
-# YOLOv8 Pose
+# MediaPipe Pose (새로 추가)
 # ============================================================
-
-class YoloPoseExtractor:
-
-    def __init__(self, model_path=YOLO_POSE_MODEL):
-
-        self.model = YOLO(model_path)
-
-        self.num_features = EXTRACTORS["yolo"]["num_features"]
-
-    def extract(self, frame):
-
-        height, width = frame.shape[:2]
-
-        result = self.model.predict(
-            frame,
-            verbose=False,
-            conf=0.35
-        )[0]
-
-        annotated = result.plot()
-
-        if (
-            result.keypoints is None
-            or result.keypoints.xy is None
-            or len(result.keypoints.xy) == 0
-        ):
-            return (
-                np.zeros(self.num_features, dtype=np.float32),
-                annotated
-            )
-
-        xy_all = result.keypoints.xy.cpu().numpy()
-
-        # 사람이 여러 명이면 가장 큰 사람을 기준으로 추출
-        if (
-            result.boxes is not None
-            and len(result.boxes) == len(xy_all)
-        ):
-
-            boxes = result.boxes.xyxy.cpu().numpy()
-
-            areas = (
-                np.maximum(0, boxes[:, 2] - boxes[:, 0])
-                * np.maximum(0, boxes[:, 3] - boxes[:, 1])
-            )
-
-            person_idx = int(np.argmax(areas))
-
-        else:
-            person_idx = 0
-
-        xy = xy_all[person_idx]
-
-        if result.keypoints.conf is not None:
-            confidence = (
-                result.keypoints.conf.cpu().numpy()[person_idx]
-            )
-        else:
-            confidence = np.ones(17, dtype=np.float32)
-
-        features = np.zeros((17, 3), dtype=np.float32)
-
-        features[:, 0] = xy[:, 0] / max(width, 1)
-        features[:, 1] = xy[:, 1] / max(height, 1)
-        features[:, 2] = confidence
-
-        valid = confidence > 0.20
-
-        features = normalize_features(
-            features.reshape(-1),
-            stride=3,
-            valid_mask=valid
-        ).reshape(17, 3)
-
-        return features.reshape(-1), annotated
-
-
-# ============================================================
-# MediaPipe Hands
-# ============================================================
-
-class MediaPipeHandsExtractor:
-
+class MediaPipePoseExtractor:
     def __init__(self):
-
-        self.mp_hands = mp.solutions.hands
-
-        self.hands = self.mp_hands.Hands(
+        self.mp_pose = mp.solutions.pose
+        self.pose = self.mp_pose.Pose(
             static_image_mode=False,
-            max_num_hands=1,
+            model_complexity=1,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
-
-        self.mp_draw = mp.solutions.drawing_utils
-
-        self.num_features = EXTRACTORS["hands"]["num_features"]
+        self.num_features = EXTRACTORS["pose"]["num_features"]
 
     def extract(self, frame):
-
-        rgb = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2RGB
-        )
-
-        results = self.hands.process(rgb)
-
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.pose.process(rgb)
         annotated = frame.copy()
 
-        if not results.multi_hand_landmarks:
+        if not results.pose_landmarks:
+            return np.zeros(self.num_features, dtype=np.float32), annotated
 
-            return (
-                np.zeros(self.num_features, dtype=np.float32),
-                annotated
-            )
-
-        landmarks = results.multi_hand_landmarks[0]
-
-        self.mp_draw.draw_landmarks(
-            annotated,
-            landmarks,
-            self.mp_hands.HAND_CONNECTIONS
+        mp.solutions.drawing_utils.draw_landmarks(
+            annotated, results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS
         )
-
-        points = _normalize_landmarks(
-            landmarks.landmark
-        )
-
-        features = normalize_features(
-            points.reshape(-1),
-            stride=3
-        )
+        points = _normalize_landmarks(results.pose_landmarks.landmark)
+        features = normalize_features(points.reshape(-1), stride=3)
 
         return features.astype(np.float32), annotated
 
     def close(self):
+        if getattr(self, "pose", None) is not None:
+            self.pose.close()
+            self.pose = None
 
+# ============================================================
+# MediaPipe Dual Hands (기존 Hands 대체)
+# ============================================================
+class MediaPipeDualHandsExtractor:
+    def __init__(self):
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2, # 양손 추적으로 변경
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        self.num_features = EXTRACTORS["dual_hands"]["num_features"]
+
+    def extract(self, frame):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.hands.process(rgb)
+        annotated = frame.copy()
+
+        # 양손 데이터를 담을 0 배열 준비 (2손 x 21관절 x 3좌표)
+        features = np.zeros((2, 21, 3), dtype=np.float32)
+
+        if results.multi_hand_landmarks:
+            for i, landmarks in enumerate(results.multi_hand_landmarks[:2]):
+                mp.solutions.drawing_utils.draw_landmarks(
+                    annotated, landmarks, self.mp_hands.HAND_CONNECTIONS
+                )
+                points = _normalize_landmarks(landmarks.landmark)
+                # 정규화된 1개 손의 데이터를 features 배열에 순서대로 채움
+                features[i] = normalize_features(points.reshape(-1), stride=3).reshape(21, 3)
+
+        return features.reshape(-1), annotated
+
+    def close(self):
         if getattr(self, "hands", None) is not None:
-
             self.hands.close()
             self.hands = None
-
-    def __del__(self):
-
-        try:
-            self.close()
-        except Exception:
-            pass
 
 
 # ============================================================
@@ -360,43 +281,24 @@ class MediaPipeHolisticExtractor:
 # ============================================================
 
 def has_valid_detection(features, extractor_name):
-
     arr = np.asarray(features, dtype=np.float32)
-
     if arr.size != EXTRACTORS[extractor_name]["num_features"]:
         return False
-
     if not np.isfinite(arr).all():
         return False
 
-    if extractor_name == "yolo":
+    if extractor_name == "pose":
+        points = arr.reshape(33, 3)
+        return int(np.sum(np.linalg.norm(points[:, :2], axis=1) > 1e-6)) >= 4
 
-        points = arr.reshape(17, 3)
-
-        return int(
-            np.sum(points[:, 2] > 0.20)
-        ) >= 4
-
-    if extractor_name == "hands":
-
-        points = arr.reshape(21, 3)
-
-        return int(
-            np.sum(
-                np.linalg.norm(points[:, :2], axis=1) > 1e-6
-            )
-        ) >= 4
+    if extractor_name == "dual_hands":
+        points = arr.reshape(42, 3)
+        return int(np.sum(np.linalg.norm(points[:, :2], axis=1) > 1e-6)) >= 4
 
     if extractor_name == "holistic":
-
         points = arr.reshape(75, 3)
-
-        active = (
-            np.linalg.norm(points[:, :2], axis=1) > 1e-6
-        )
-
+        active = (np.linalg.norm(points[:, :2], axis=1) > 1e-6)
         return int(active.sum()) >= 4
-
     return False
 
 
@@ -405,23 +307,8 @@ def has_valid_detection(features, extractor_name):
 # ============================================================
 
 def get_extractor(name: str):
-
     name = name.lower()
-
-    if name == "yolo":
-        return YoloPoseExtractor()
-
-    if name == "hands":
-        return MediaPipeHandsExtractor()
-
-    if name == "holistic":
-        return MediaPipeHolisticExtractor()
-
-    raise ValueError(
-        f"알 수 없는 추출기: {name}. "
-        f"사용 가능: {list(EXTRACTORS.keys())}"
-    )
-
-
-# 하위 호환성
-PoseExtractor = YoloPoseExtractor
+    if name == "pose": return MediaPipePoseExtractor()
+    if name == "dual_hands": return MediaPipeDualHandsExtractor()
+    if name == "holistic": return MediaPipeHolisticExtractor()
+    raise ValueError(f"알 수 없는 추출기: {name}")

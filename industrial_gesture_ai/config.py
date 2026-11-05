@@ -8,15 +8,15 @@ OUTPUT_DIR = ROOT / "outputs"
 
 # 관절 특징 추출기별 입력 크기
 EXTRACTORS = {
-    "yolo": {
-        "name": "YOLOv8-Pose",
-        "num_features": 17 * 3,
-        "description": "전신 17개 관절 특징",
+    "pose": {
+        "name": "MediaPipe Pose",
+        "num_features": 33 * 3,
+        "description": "전신 33개 관절 3D 특징",
     },
-    "hands": {
-        "name": "MediaPipe Hands",
-        "num_features": 21 * 3,
-        "description": "손 21개 랜드마크 특징",
+    "dual_hands": {
+        "name": "MediaPipe Dual Hands",
+        "num_features": 42 * 3,
+        "description": "양손 42개 랜드마크 3D 특징",
     },
     "holistic": {
         "name": "MediaPipe Holistic",
@@ -33,15 +33,14 @@ YOLO_POSE_MODEL = "yolov8n-pose.pt"
 CLASS_NAMES = {
     0: "STOP",
     1: "UP",
-    2: "DOWN",
-    3: "OTHER",
+    2: "EMERGENCY",
+    
 }
 
 CLASS_KOREAN = {
     0: "작업 정지",
     1: "장비 상승",
-    2: "장비 하강",
-    3: "수신호 아님 / 기타",
+    2: "비상"
 }
 
 NUM_CLASSES = len(CLASS_NAMES)
