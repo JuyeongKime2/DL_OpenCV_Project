@@ -641,12 +641,12 @@ def plot_dashboard(reports, df, save_path):
 
 
 def generate_fancy_visualizations(comparison_df):
-    """학습 종료 후 화려한 시각화 일괄 생성."""
+    """학습 종료 후 시각화 일괄 생성."""
     reports = _load_reports()
     if not reports:
         print("[시각화] report.json이 없어 건너뜁니다.")
         return
-    print("\n화려한 시각화 생성 중...")
+    print("\n이미지 생성 중...")
     plot_radar(reports, OUTPUT_DIR / "radar_chart.png")
     plot_speed_accuracy(comparison_df, OUTPUT_DIR / "speed_accuracy.png")
     plot_class_heatmap(reports, OUTPUT_DIR / "class_f1_heatmap.png")
