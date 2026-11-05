@@ -1,4 +1,3 @@
-
 """YOLOv8-Pose / MediaPipe Hands / MediaPipe Holistic 특징 추출 유틸리티."""
 
 import cv2
@@ -109,14 +108,14 @@ class MediaPipePoseExtractor:
             self.pose = None
 
 # ============================================================
-# MediaPipe Dual Hands (기존 Hands 대체)
+# MediaPipe Dual Hands (기존 Hands 대체 - 좌우 손 고정 적용)
 # ============================================================
 class MediaPipeDualHandsExtractor:
     def __init__(self):
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
-            max_num_hands=2, # 양손 추적으로 변경
+            max_num_hands=2,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
@@ -127,17 +126,28 @@ class MediaPipeDualHandsExtractor:
         results = self.hands.process(rgb)
         annotated = frame.copy()
 
-        # 양손 데이터를 담을 0 배열 준비 (2손 x 21관절 x 3좌표)
+        # 양손 데이터를 담을 0 배열 준비 [0슬롯: 왼손, 1슬롯: 오른손] (2손 x 21관절 x 3좌표)
         features = np.zeros((2, 21, 3), dtype=np.float32)
 
-        if results.multi_hand_landmarks:
-            for i, landmarks in enumerate(results.multi_hand_landmarks[:2]):
+        if results.multi_hand_landmarks and results.multi_handedness:
+            for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
+                if idx >= 2:
+                    break
+                
+                # MediaPipe의 classification label 확인 ("Left" 또는 "Right")
+                # 주의: 화면 기준이므로 카메라 반전 여부에 따라 레이블이 다를 수 있으나, 
+                # 일반적으로 multi_handedness는 카메라 센서 기준 좌/우를 반환합니다.
+                handedness_label = results.multi_handedness[idx].classification[0].label
+                
+                # 좌우 손 구분에 따른 슬롯 고정 (Left -> 0번 슬롯, Right -> 1번 슬롯)
+                # 만약 화면 좌우 반전으로 반대로 잡힌다면 아래 조건을 조정하세요.
+                slot_idx = 0 if handedness_label == "Left" else 1
+
                 mp.solutions.drawing_utils.draw_landmarks(
-                    annotated, landmarks, self.mp_hands.HAND_CONNECTIONS
+                    annotated, hand_landmarks, self.mp_hands.HAND_CONNECTIONS
                 )
-                points = _normalize_landmarks(landmarks.landmark)
-                # 정규화된 1개 손의 데이터를 features 배열에 순서대로 채움
-                features[i] = normalize_features(points.reshape(-1), stride=3).reshape(21, 3)
+                points = _normalize_landmarks(hand_landmarks.landmark)
+                features[slot_idx] = normalize_features(points.reshape(-1), stride=3).reshape(21, 3)
 
         return features.reshape(-1), annotated
 
@@ -277,7 +287,7 @@ class MediaPipeHolisticExtractor:
 
 
 # ============================================================
-# 관절 검출 여부 확인
+# 관절 검출 유효성 확인 (기준 강화)
 # ============================================================
 
 def has_valid_detection(features, extractor_name):
@@ -288,17 +298,30 @@ def has_valid_detection(features, extractor_name):
         return False
 
     if extractor_name == "pose":
+        # Pose는 상체/전신 관절 중 최소 10개 이상이 유효하게 잡혀야 함
         points = arr.reshape(33, 3)
-        return int(np.sum(np.linalg.norm(points[:, :2], axis=1) > 1e-6)) >= 4
+        return int(np.sum(np.linalg.norm(points[:, :2], axis=1) > 1e-6)) >= 10
 
     if extractor_name == "dual_hands":
+        # Dual Hands는 양손 합쳐서 최소 10개 이상의 손가락 관절이 잡혀야 함 (노이즈 방지)
         points = arr.reshape(42, 3)
-        return int(np.sum(np.linalg.norm(points[:, :2], axis=1) > 1e-6)) >= 4
+        return int(np.sum(np.linalg.norm(points[:, :2], axis=1) > 1e-6)) >= 10
 
     if extractor_name == "holistic":
+        # Holistic은 전신(33개) 외에 '손 관절(좌우 각 21개)' 중 적어도 한쪽 손이라도
+        # 유의미하게(예: 손가락 관절 5개 이상) 잡혀야 유효 프레임으로 인정
         points = arr.reshape(75, 3)
-        active = (np.linalg.norm(points[:, :2], axis=1) > 1e-6)
-        return int(active.sum()) >= 4
+        
+        # 슬롯별 분리: Pose(0~32), Left Hand(33~53), Right Hand(54~74)
+        left_hand_points = points[33:54, :2]
+        right_hand_points = points[54:75, :2]
+        
+        left_active = int(np.sum(np.linalg.norm(left_hand_points, axis=1) > 1e-6))
+        right_active = int(np.sum(np.linalg.norm(right_hand_points, axis=1) > 1e-6))
+        
+        # 적어도 한쪽 손에서 5개 이상의 관절이 검출되어야 함 (양손 수신호 품질 보장)
+        return (left_active >= 5) or (right_active >= 5)
+
     return False
 
 
